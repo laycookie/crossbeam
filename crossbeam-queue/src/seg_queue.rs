@@ -5,6 +5,7 @@ use core::{
     fmt,
     marker::PhantomData,
     mem::MaybeUninit,
+    ops::Index,
     panic::{RefUnwindSafe, UnwindSafe},
     ptr,
     sync::atomic::{self, AtomicPtr, AtomicUsize, Ordering},
@@ -500,14 +501,123 @@ impl<T> Drop for SegQueue<T> {
 }
 
 impl<T> fmt::Debug for SegQueue<T> {
-    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+    default fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.pad("SegQueue { .. }")
+    }
+}
+impl<T: fmt::Debug> fmt::Debug for SegQueue<T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut head = self.head.index.load(Ordering::Acquire);
+        let mut tail = self.tail.index.load(Ordering::Acquire);
+        let mut block = self.head.block.load(Ordering::Acquire);
+
+        let mut first = true;
+        write!(f, "SegQueue {{ ")?;
+
+        unsafe {
+            while head != tail {
+                let offset = (head >> SHIFT) % LAP;
+
+                if offset < BLOCK_CAP && !block.is_null() {
+                    let slot = (*block).slots.get_unchecked(offset);
+                    let state = slot.state.load(Ordering::Acquire);
+
+                    if state & WRITE != 0 && state & READ == 0 {
+                        let value = &*slot.value.get();
+                        let value: &T = unsafe { value.assume_init_ref() };
+
+                        if !first {
+                            write!(f, ", ")?;
+                        }
+                        first = false;
+                        write!(f, "{:?}", value)?;
+                    }
+                } else if offset == BLOCK_CAP {
+                    block = (*block).next.load(Ordering::Acquire);
+                }
+
+                head = head.wrapping_add(1 << SHIFT);
+            }
+        }
+
+        write!(f, " }}")
     }
 }
 
 impl<T> Default for SegQueue<T> {
     fn default() -> Self {
         Self::new()
+    }
+}
+
+impl<T> Index<usize> for SegQueue<T> {
+    type Output = T;
+
+    fn index(&self, index: usize) -> &Self::Output {
+        let len = self.len();
+        assert!(index < len, "index out of bounds: the len is {} but the index is {}", len, index);
+
+        let mut head = self.head.index.load(Ordering::Acquire);
+        let mut block = self.head.block.load(Ordering::Acquire);
+        let mut current = 0;
+
+        unsafe {
+            while current <= index {
+                let offset = (head >> SHIFT) % LAP;
+
+                if offset < BLOCK_CAP && !block.is_null() {
+                    let slot = (*block).slots.get_unchecked(offset);
+                    let state = slot.state.load(Ordering::Acquire);
+
+                    if state & WRITE != 0 && state & READ == 0 {
+                        if current == index {
+                            let value = &*slot.value.get();
+                            return value.assume_init_ref();
+                        }
+                        current += 1;
+                    }
+                } else if offset == BLOCK_CAP {
+                    block = (*block).next.load(Ordering::Acquire);
+                }
+
+                head = head.wrapping_add(1 << SHIFT);
+            }
+        }
+
+        unreachable!()
+    }
+}
+
+impl<T> SegQueue<T> {
+    /// Drains the first `n` elements from the queue.
+    ///
+    /// If `n` is greater than the number of elements in the queue, all elements are drained.
+    ///
+    /// # Examples
+    ///
+    /// ```
+    /// use crossbeam_queue::SegQueue;
+    ///
+    /// let mut q = SegQueue::new();
+    /// q.push(1);
+    /// q.push(2);
+    /// q.push(3);
+    /// q.push(4);
+    ///
+    /// {
+    ///     let mut drain = q.drain(2);
+    ///     assert_eq!(drain.next(), Some(1));
+    ///     assert_eq!(drain.next(), Some(2));
+    ///     assert_eq!(drain.next(), None);
+    /// }
+    ///
+    /// assert_eq!(q.len(), 2);
+    /// ```
+    pub fn drain(&mut self, n: usize) -> Drain<'_, T> {
+        Drain {
+            queue: self,
+            remaining: n,
+        }
     }
 }
 
@@ -568,3 +678,91 @@ impl<T> Iterator for IntoIter<T> {
         }
     }
 }
+
+/// An iterator that drains a [`SegQueue`], removing elements.
+///
+/// This iterator is created by [`SegQueue::drain`].
+pub struct Drain<'a, T> {
+    queue: &'a mut SegQueue<T>,
+    remaining: usize,
+}
+
+impl<T> Drain<'_, T> {
+    fn pop(&mut self) -> Option<T> {
+        if self.remaining == 0 {
+            return None;
+        }
+        let item = self.queue.pop();
+        if item.is_some() {
+            self.remaining -= 1;
+        }
+        item
+    }
+}
+
+impl<T> Drop for Drain<'_, T> {
+    fn drop(&mut self) {
+        while self.pop().is_some() {}
+    }
+}
+
+impl<T> fmt::Debug for Drain<'_, T> {
+    default fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        f.debug_struct("Drain").finish_non_exhaustive()
+    }
+}
+
+impl<T: fmt::Debug> fmt::Debug for Drain<'_, T> {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let mut head = self.queue.head.index.load(Ordering::Acquire);
+        let mut block = self.queue.head.block.load(Ordering::Acquire);
+        let mut remaining = self.remaining;
+
+        let mut first = true;
+        write!(f, "Drain([")?;
+
+        unsafe {
+            while remaining > 0 {
+                let offset = (head >> SHIFT) % LAP;
+
+                if offset < BLOCK_CAP && !block.is_null() {
+                    let slot = (*block).slots.get_unchecked(offset);
+                    let state = slot.state.load(Ordering::Acquire);
+
+                    if state & WRITE != 0 && state & READ == 0 {
+                        let value = &*slot.value.get();
+                        let value: &T = unsafe { value.assume_init_ref() };
+
+                        if !first {
+                            write!(f, ", ")?;
+                        }
+                        first = false;
+                        write!(f, "{:?}", value)?;
+                        remaining -= 1;
+                    }
+                } else if offset == BLOCK_CAP {
+                    block = (*block).next.load(Ordering::Acquire);
+                }
+
+                head = head.wrapping_add(1 << SHIFT);
+            }
+        }
+
+        write!(f, "])")
+    }
+}
+
+impl<T> Iterator for Drain<'_, T> {
+    type Item = T;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        self.pop()
+    }
+
+    fn size_hint(&self) -> (usize, Option<usize>) {
+        let remaining = self.remaining.min(self.queue.len());
+        (remaining, Some(remaining))
+    }
+}
+
+impl<T> ExactSizeIterator for Drain<'_, T> {}

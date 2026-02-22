@@ -1,0 +1,67 @@
+{
+  description = "Front-end for chat backends";
+
+  inputs = {
+    nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";  # Specify the Nixpkgs version
+    rust-overlay.url = "github:oxalica/rust-overlay";
+  };
+
+  outputs = { self, nixpkgs, rust-overlay }:
+  let
+    system = "x86_64-linux";
+	overlays = [
+		(import rust-overlay)
+	];
+    pkgs = import nixpkgs {
+		inherit system overlays;
+	};
+  in
+  {
+		devShells.${system} = {
+			default = pkgs.mkShell.override { stdenv = pkgs.clangStdenv; } {
+    		    packages = with pkgs; [
+    		      rust-bin.nightly.latest.default
+                  rust-analyzer
+
+				  # python3
+				  # ninja
+				  # clang
+				  # clang-tools
+
+    		      # libxkbcommon
+    		      # wayland
+
+				  # vulkan-loader
+				  vulkan-validation-layers
+				  vulkan-tools
+
+				  # libappindicator
+
+				  openssl
+				  pkg-config
+
+				  # gtk3
+				  # xdotool
+				  # libayatana-appindicator
+    		    ];
+				LD_LIBRARY_PATH = pkgs.lib.makeLibraryPath [
+					pkgs.libxkbcommon
+					pkgs.wayland
+					pkgs.vulkan-loader
+
+					# pkgs.freetype
+					# pkgs.fontconfig
+					# pkgs.libinput
+					# pkgs.qt5.full
+
+
+					# pkgs.libayatana-appindicator
+				];
+
+    		    # RUST_BACKTRACE = "full";
+    		    # WINIT_UNIX_BACKEND = "wayland";
+    		    WINIT_UNIX_BACKEND = "x11";
+    		};
+		};
+	};
+}
